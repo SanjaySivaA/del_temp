@@ -79,6 +79,39 @@ The original simple-file workflow still works: run the CUDA program with
 that same working directory. With no arguments it saves `delaunay_gpu.png`.
 The plotter also handles a single triangle and outputs containing no triangles.
 
+## Auditing the exact file shown in a plot
+
+A saved plot and its triangle count do not establish correctness. To check an
+existing output without rebuilding, rerunning CUDA, or overwriting artifacts:
+
+```python
+%cd /content/del_temp
+!python3 tests/colab_check.py --check-output colab-results/random_32_seed_42.actual.1.tri --case random_32_seed_42
+```
+
+Use the same `.tri` path that was passed to `plot.py --pbbs`. The audit checks
+unused points, points inside faces or on unsplit edges, edges with more than
+two incident faces, crossing edges, and the empty-circumcircle condition. It
+reports offending point/face/edge indices (zero based), then compares the
+complete triangle set against the expected result if the geometry checks pass.
+The regular checker runs perform these same checks.
+
+Larger triangular outlines in an edge plot can be unions of several faces;
+only a triple actually listed in the output is a face. An input point strictly
+inside one of those listed faces is invalid. The geometric audit distinguishes
+these cases using the file's actual triples.
+
+Checker regressions deliberately include an enclosing face and crossing edges
+with the correct triangle counts, plus a planar mesh with the wrong Delaunay
+diagonal. Run them in Colab with:
+
+```python
+!python3 -m unittest discover -s tests -p "test_colab_check.py" -v
+```
+
+These new checks and regressions have been statically reviewed, not executed
+in the development environment.
+
 ## Sample inputs and expected triangles
 
 Point IDs are zero based, in the listed order. Every row below is embedded in

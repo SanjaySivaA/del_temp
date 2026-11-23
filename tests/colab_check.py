@@ -147,6 +147,53 @@ def read_triangles(path):
     return points, triangles
 
 
+def check_geometry(points, triangles):
+    """Report geometric witnesses, independently of reference-set comparison.
+
+    Call after checking indices, distinct vertices and nonzero triangle areas.
+    The fixture coordinates are integers, so these predicate signs are exact.
+    """
+    used = {i for triangle in triangles for i in triangle}
+    missing = sorted(set(range(len(points))) - used)
+    if missing:
+        raise ValueError(f"Input points unused by all triangles: {missing}")
+
+    edges = {}
+    for face, triangle in enumerate(triangles):
+        a, b, c = (points[i] for i in triangle)
+        direction = 1 if orient(a, b, c) > 0 else -1
+        for i, point in enumerate(points):
+            if i in triangle:
+                continue
+            sides = [direction * orient(u, v, point) for u, v in ((a, b), (b, c), (c, a))]
+            if all(side >= 0 for side in sides):
+                location = "strictly inside" if all(side > 0 for side in sides) else "on an edge of"
+                raise ValueError(f"Point {i} {point} lies {location} "
+                                 f"face {face} with vertices {triangle}")
+        for edge in combinations(sorted(triangle), 2):
+            edges.setdefault(edge, []).append(face)
+
+    for edge, faces in edges.items():
+        if len(faces) > 2:
+            raise ValueError(f"Edge {edge} is shared by more than two faces: {faces}")
+    for first, second in combinations(edges, 2):
+        if set(first) & set(second):
+            continue
+        a, b = (points[i] for i in first)
+        c, d = (points[i] for i in second)
+        if (orient(a, b, c) * orient(a, b, d) < 0
+                and orient(c, d, a) * orient(c, d, b) < 0):
+            raise ValueError(f"Edges {first} and {second} cross away from their vertices")
+
+    for face, triangle in enumerate(triangles):
+        a, b, c = (points[i] for i in triangle)
+        direction = 1 if orient(a, b, c) > 0 else -1
+        for i, point in enumerate(points):
+            if i not in triangle and direction * incircle(a, b, c, point) > 0:
+                raise ValueError(f"Point {i} {point} lies inside the circumcircle of "
+                                 f"face {face} with vertices {triangle}: not Delaunay")
+
+
 def check_output(case, path):
     points, triangles = read_triangles(path)
     # These fixtures contain exactly representable small integers. No coordinate
@@ -163,6 +210,7 @@ def check_output(case, path):
     actual = canonical(triangles)
     if len(actual) != len(triangles):
         raise ValueError("Duplicate triangle(s) in output")
+    check_geometry(case.points, triangles)
     alternatives = [canonical(expected) for expected in case.expected]
     if actual not in alternatives:
         closest = min(alternatives, key=lambda expected: len(actual ^ expected))
@@ -210,11 +258,31 @@ def main():
                         help="Write inputs/expected outputs without compiling or running CUDA")
     parser.add_argument("--plot", action="store_true",
                         help="Run plot.py on the first output of each case and save PNGs")
+    parser.add_argument("--check-output", type=Path,
+                        help="Audit a saved PBBS output without running CUDA; requires --case")
+    parser.add_argument("--case", help="Fixture name for --check-output, e.g. random_32_seed_42")
     args = parser.parse_args()
+    if (args.check_output is None) != (args.case is None):
+        parser.error("--check-output and --case must be specified together")
+    if args.check_output and (args.binary or args.generate_only or args.plot):
+        parser.error("--check-output cannot be combined with --binary, --generate-only or --plot")
+    cases = make_cases()
+    if args.check_output:
+        case = next((case for case in cases if case.name == args.case), None)
+        if case is None:
+            parser.error("Unknown case. Choose from: " + ", ".join(case.name for case in cases))
+        path = args.check_output.resolve()
+        try:
+            count = check_output(case, path)
+        except (OSError, ValueError) as error:
+            print(f"FAIL {case.name}: {error}\n  Checked file: {path}", flush=True)
+            return 1
+        print(f"PASS {case.name}: {count} triangles; geometry and expected triangle set match."
+              f"\n  Checked file: {path}", flush=True)
+        return 0
     repo = args.repo.resolve()
     directory = (args.output_dir or repo / "colab-results").resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    cases = make_cases()
     inputs = {case.name: write_fixtures(case, directory) for case in cases}
     print(f"Generated {len(cases)} cases in {directory}", flush=True)
     for case in cases:
