@@ -2,8 +2,9 @@
 
 `colab_check.py` builds `src/main.cu`, `src/delaunay.cu`, and `src/io.cpp`,
 generates PBBS samples and expected outputs, runs the program, and checks the
-result. It uses only the Python standard library; no pip installs, NumPy,
-SciPy, plotting, or Thrust sample are involved.
+result. Correctness checking uses only the Python standard library. Optional
+plotting calls the repository's `plot.py` and requires NumPy and Matplotlib in
+the Colab runtime. No package installation is performed by the checker.
 
 Select a GPU runtime in Colab, clone or upload this repository **including
 `tests/colab_check.py`**, then run this Python cell. Adjust the checkout path if
@@ -27,9 +28,56 @@ and running require a working CUDA toolkit and GPU in the Colab runtime.
 The default is three runs of each of ten cases. An entirely passing run ends
 with `30/30 runs passed`. This is the **expected success summary**, not a result
 observed in the development environment. Exit status is 0 for success, 1 for
-output/runtime failures, and 2 for setup/reference/build errors. A failure in
+output/runtime/plotting failures, and 2 for setup/reference/build errors. A failure in
 one case does not skip the remaining cases; each program run has a 60-second
 timeout. Build failures are recorded in `build.log`.
+
+## Viewing the triangulation in Colab
+
+Use the updated `plot.py` to plot an existing checker output without rerunning
+CUDA. Run this cell after the checker has produced the selected `.tri` file:
+
+```python
+from IPython.display import Image, display
+import subprocess
+
+repo = "/content/del_temp"
+image_path = f"{repo}/colab-results/random_32_seed_42.png"
+subprocess.run([
+    "python3", f"{repo}/plot.py",
+    "--pbbs", f"{repo}/colab-results/random_32_seed_42.actual.1.tri",
+    "--output", image_path, "--no-show",
+], check=True)
+display(Image(filename=image_path, width=700))
+```
+
+Replace `random_32_seed_42` with another case name to view it. The explicit
+`display` call shows the saved PNG inside the notebook; running a plotting
+script as a subprocess alone does not embed its figure in the cell output.
+
+To generate a PNG for every case while running the checks:
+
+```python
+%cd /content/del_temp
+!python3 tests/colab_check.py --plot
+
+from pathlib import Path
+from IPython.display import Image, display
+
+for image_path in sorted(Path("/content/del_temp/colab-results").glob("*.png")):
+    print(image_path.stem)
+    display(Image(filename=str(image_path), width=600))
+```
+
+`--plot` saves the first run of each case as `<case>.png`, with plotting logs
+in `<case>.plot.log`. It also tries to draw incorrect outputs to help diagnose
+failures. A saved image does not imply that the correctness check passed.
+`--generate-only` writes fixtures and exits without plotting.
+
+The original simple-file workflow still works: run the CUDA program with
+`--simple` to create `points.txt` and `triangles.txt`, then run `plot.py` from
+that same working directory. With no arguments it saves `delaunay_gpu.png`.
+The plotter also handles a single triangle and outputs containing no triangles.
 
 ## Sample inputs and expected triangles
 

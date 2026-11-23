@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build and check this CUDA implementation on a GPU runtime, e.g. Colab.
 
-Uses only Python's standard library. Inputs and expected PBBS outputs are
-written before building/running CUDA; --generate-only needs no CUDA at all.
+Checking uses only Python's standard library; optional --plot calls plot.py
+and needs NumPy/Matplotlib. Inputs and expected PBBS outputs are written before
+building/running CUDA; --generate-only needs no CUDA at all.
 """
 
 import argparse
@@ -207,6 +208,8 @@ def main():
                         help="Timeout in seconds per CUDA invocation (default: 60)")
     parser.add_argument("--generate-only", action="store_true",
                         help="Write inputs/expected outputs without compiling or running CUDA")
+    parser.add_argument("--plot", action="store_true",
+                        help="Run plot.py on the first output of each case and save PNGs")
     args = parser.parse_args()
     repo = args.repo.resolve()
     directory = (args.output_dir or repo / "colab-results").resolve()
@@ -240,6 +243,7 @@ def main():
         run_logged(command, repo, directory / "build.log", timeout=180)
 
     passed = 0
+    plot_failures = 0
     for case in cases:
         successes = 0
         for repetition in range(1, args.repeat + 1):
@@ -260,9 +264,30 @@ def main():
         if successes == args.repeat:
             print(f"PASS {case.name}: {len(case.expected[0])} triangles "
                   f"({successes}/{args.repeat} runs)", flush=True)
+        if args.plot:
+            # Plot the actual first output, even when it fails the reference
+            # comparison, so a drawable incorrect mesh can be inspected.
+            plot_path = directory / f"{case.name}.png"
+            plot_log = directory / f"{case.name}.plot.log"
+            try:
+                if plot_path.exists():
+                    plot_path.unlink()
+                run_logged(
+                    [sys.executable, str(repo / "plot.py"), "--pbbs",
+                     str(directory / f"{case.name}.actual.1.tri"),
+                     "--output", str(plot_path), "--no-show"],
+                    directory, plot_log, args.timeout)
+                if not plot_path.is_file():
+                    raise RuntimeError(f"Plot image was not written; see {plot_log}")
+                print(f"PLOT {case.name}: {plot_path}", flush=True)
+            except (OSError, ValueError, RuntimeError) as error:
+                plot_failures += 1
+                print(f"PLOT FAILED {case.name}: {error}", flush=True)
     total = len(cases) * args.repeat
     print(f"\n{passed}/{total} runs passed. Artifacts: {directory}", flush=True)
-    return 0 if passed == total else 1
+    if args.plot:
+        print(f"{len(cases) - plot_failures}/{len(cases)} plots saved.", flush=True)
+    return 0 if passed == total and plot_failures == 0 else 1
 
 
 if __name__ == "__main__":
