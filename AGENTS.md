@@ -8,7 +8,7 @@ A sample code written is Thrust is available in `sample.cu`. This is however jus
 2. Launch kernels with appropriate values for blocks_per_grid, threads_per_block, amount of shared memory, streams (if any)
 3. Copy the output from device memory to host memory.
 
-A plotting script is given in `plot.py`.
+A plotting script is given in `plot.py`. Do not try to execute this script as numpy and matplotlib is not available.
 
 Write custom __global__ and __device__ kernels and explicit CUDA runtime API calls (cudaMalloc, cudaMemcpy, cudaFree, streams, and events) for memory management, execution configuration, and synchronization instead of relying on Thrust, focusing directly on project files rather than browsing external references.
 
