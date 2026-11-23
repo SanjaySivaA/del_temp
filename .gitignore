@@ -1,0 +1,6 @@
+delaunay
+*.o
+src/*.o
+points.txt
+triangles.txt
+delaunay_gpu.png
