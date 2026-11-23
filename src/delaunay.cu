@@ -47,7 +47,8 @@ __device__ inline void atomicMaxDouble(double* address, double val) {
     } while (assumed != old);
 }
 
-// Bounding box reduction kernel with shared memory and bank-conflict avoidance
+// Bounding box reduction kernel with shared memory and warp shuffle instructions.
+// Bank conflicts are eliminated by power-of-2 strides and warp shuffle.
 __global__ void compute_bounds_kernel(
     const Point2D* points,
     double* d_min_x, double* d_max_x,
@@ -79,8 +80,8 @@ __global__ void compute_bounds_kernel(
     s_max_y[tid] = my_max_y;
     __syncthreads();
 
-    // Reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    // Block reduction down to 32 elements using shared memory
+    for (int s = blockDim.x / 2; s >= 32; s >>= 1) {
         if (tid < s) {
             s_min_x[tid] = fmin(s_min_x[tid], s_min_x[tid + s]);
             s_max_x[tid] = fmax(s_max_x[tid], s_max_x[tid + s]);
@@ -90,19 +91,34 @@ __global__ void compute_bounds_kernel(
         __syncthreads();
     }
 
-    if (tid == 0) {
-        atomicMinDouble(d_min_x, s_min_x[0]);
-        atomicMaxDouble(d_max_x, s_max_x[0]);
-        atomicMinDouble(d_min_y, s_min_y[0]);
-        atomicMaxDouble(d_max_y, s_max_y[0]);
+    // Warp-level reduction using hardware warp shuffles (zero bank conflicts)
+    if (tid < 32) {
+        my_min_x = s_min_x[tid];
+        my_max_x = s_max_x[tid];
+        my_min_y = s_min_y[tid];
+        my_max_y = s_max_y[tid];
+
+        for (int offset = 16; offset > 0; offset /= 2) {
+            my_min_x = fmin(my_min_x, __shfl_down_sync(0xFFFFFFFF, my_min_x, offset));
+            my_max_x = fmax(my_max_x, __shfl_down_sync(0xFFFFFFFF, my_max_x, offset));
+            my_min_y = fmin(my_min_y, __shfl_down_sync(0xFFFFFFFF, my_min_y, offset));
+            my_max_y = fmax(my_max_y, __shfl_down_sync(0xFFFFFFFF, my_max_y, offset));
+        }
+
+        if (tid == 0) {
+            atomicMinDouble(d_min_x, my_min_x);
+            atomicMaxDouble(d_max_x, my_max_x);
+            atomicMinDouble(d_min_y, my_min_y);
+            atomicMaxDouble(d_max_y, my_max_y);
+        }
     }
 }
 
 // Normalizes points to [0.1, 0.9] and computes 32-bit Morton code keys
-__global__ void normalize_and_morton_keys(
+__global__ void compute_morton_keys_kernel(
     const Point2D* in_points,
-    PointWithIdx* out_points,
     uint32_t* cell_keys,
+    int* perm,
     double min_x, double max_x,
     double min_y, double max_y,
     int n, int padded_n
@@ -124,35 +140,35 @@ __global__ void normalize_and_morton_keys(
         uint32_t qy = (uint32_t)fmin(fmax(norm_y * 65535.0, 0.0), 65535.0);
 
         cell_keys[idx] = morton2D(qx, qy);
-        out_points[idx] = PointWithIdx(Point2D(norm_x, norm_y), idx);
+        perm[idx] = idx;
     } else {
         cell_keys[idx] = 0xFFFFFFFFU;
-        out_points[idx] = PointWithIdx(Point2D(0.0, 0.0), -1);
+        perm[idx] = -1;
     }
 }
 
 // -----------------------------------------------------------------------------
-// Bitonic Sort with Shared Memory & Conflict Minimization
+// Bitonic Sort with Shared Memory & Zero Bank Conflicts
+// (Using 4-byte keys and 4-byte indices: 100% bank-conflict-free)
 // -----------------------------------------------------------------------------
 
 __global__ void bitonic_sort_shared_kernel(
     uint32_t* d_keys,
-    PointWithIdx* d_vals,
-    int n,
+    int* d_perm,
     int padded_n
 ) {
     __shared__ uint32_t s_keys[1024];
-    __shared__ PointWithIdx s_vals[1024];
+    __shared__ int s_perm[1024];
 
     int tid = threadIdx.x;
     int idx = blockIdx.x * 1024 + tid;
 
     if (idx < padded_n) {
         s_keys[tid] = d_keys[idx];
-        s_vals[tid] = d_vals[idx];
+        s_perm[tid] = d_perm[idx];
     } else {
         s_keys[tid] = 0xFFFFFFFFU;
-        s_vals[tid] = PointWithIdx(Point2D(0.0, 0.0), -1);
+        s_perm[tid] = -1;
     }
     __syncthreads();
 
@@ -164,12 +180,12 @@ __global__ void bitonic_sort_shared_kernel(
                 if ((tid & k) == 0) {
                     if (s_keys[tid] > s_keys[ixj]) {
                         uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                        PointWithIdx tv = s_vals[tid]; s_vals[tid] = s_vals[ixj]; s_vals[ixj] = tv;
+                        int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
                     }
                 } else {
                     if (s_keys[tid] < s_keys[ixj]) {
                         uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                        PointWithIdx tv = s_vals[tid]; s_vals[tid] = s_vals[ixj]; s_vals[ixj] = tv;
+                        int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
                     }
                 }
             }
@@ -179,13 +195,13 @@ __global__ void bitonic_sort_shared_kernel(
 
     if (idx < padded_n) {
         d_keys[idx] = s_keys[tid];
-        d_vals[idx] = s_vals[tid];
+        d_perm[idx] = s_perm[tid];
     }
 }
 
 __global__ void bitonic_merge_global_kernel(
     uint32_t* d_keys,
-    PointWithIdx* d_vals,
+    int* d_perm,
     int j,
     int k,
     int padded_n
@@ -198,12 +214,12 @@ __global__ void bitonic_merge_global_kernel(
         if ((i & k) == 0) {
             if (d_keys[i] > d_keys[ixj]) {
                 uint32_t tk = d_keys[i]; d_keys[i] = d_keys[ixj]; d_keys[ixj] = tk;
-                PointWithIdx tv = d_vals[i]; d_vals[i] = d_vals[ixj]; d_vals[ixj] = tv;
+                int tp = d_perm[i]; d_perm[i] = d_perm[ixj]; d_perm[ixj] = tp;
             }
         } else {
             if (d_keys[i] < d_keys[ixj]) {
                 uint32_t tk = d_keys[i]; d_keys[i] = d_keys[ixj]; d_keys[ixj] = tk;
-                PointWithIdx tv = d_vals[i]; d_vals[i] = d_vals[ixj]; d_vals[ixj] = tv;
+                int tp = d_perm[i]; d_perm[i] = d_perm[ixj]; d_perm[ixj] = tp;
             }
         }
     }
@@ -211,33 +227,34 @@ __global__ void bitonic_merge_global_kernel(
 
 __global__ void bitonic_merge_shared_kernel(
     uint32_t* d_keys,
-    PointWithIdx* d_vals,
+    int* d_perm,
     int k,
     int padded_n
 ) {
     __shared__ uint32_t s_keys[1024];
-    __shared__ PointWithIdx s_vals[1024];
+    __shared__ int s_perm[1024];
 
     int tid = threadIdx.x;
     int idx = blockIdx.x * 1024 + tid;
     if (idx >= padded_n) return;
 
     s_keys[tid] = d_keys[idx];
-    s_vals[tid] = d_vals[idx];
+    s_perm[tid] = d_perm[idx];
     __syncthreads();
 
+    // Complete inner stages in shared memory
     for (int j = 512; j > 0; j >>= 1) {
         int ixj = tid ^ j;
         if (ixj > tid) {
             if ((idx & k) == 0) {
                 if (s_keys[tid] > s_keys[ixj]) {
                     uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                    PointWithIdx tv = s_vals[tid]; s_vals[tid] = s_vals[ixj]; s_vals[ixj] = tv;
+                    int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
                 }
             } else {
                 if (s_keys[tid] < s_keys[ixj]) {
                     uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                    PointWithIdx tv = s_vals[tid]; s_vals[tid] = s_vals[ixj]; s_vals[ixj] = tv;
+                    int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
                 }
             }
         }
@@ -245,19 +262,32 @@ __global__ void bitonic_merge_shared_kernel(
     }
 
     d_keys[idx] = s_keys[tid];
-    d_vals[idx] = s_vals[tid];
+    d_perm[idx] = s_perm[tid];
 }
 
 __global__ void unpack_sorted_points(
-    const PointWithIdx* d_sort_vals,
-    Point2D* d_points,
-    int* d_orig_indices,
+    const Point2D* in_points,
+    const int* d_perm,
+    Point2D* out_points,
+    int* out_orig_indices,
+    double min_x, double max_x,
+    double min_y, double max_y,
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        d_points[idx] = d_sort_vals[idx].pt;
-        d_orig_indices[idx] = d_sort_vals[idx].orig_idx;
+        int orig_id = d_perm[idx];
+        Point2D p = in_points[orig_id];
+        double span_x = max_x - min_x;
+        double span_y = max_y - min_y;
+        double span = fmax(span_x, span_y);
+        if (span <= 1e-12) span = 1.0;
+
+        double norm_x = 0.1 + 0.8 * (p.x - min_x) / span;
+        double norm_y = 0.1 + 0.8 * (p.y - min_y) / span;
+
+        out_points[idx] = Point2D(norm_x, norm_y);
+        out_orig_indices[idx] = orig_id;
     }
 }
 
@@ -498,7 +528,7 @@ __global__ void repair_flipped_neighbors(
 }
 
 // -----------------------------------------------------------------------------
-// Stream Compaction / Output Filtering Kernel using Shared Memory
+// Warp-Aggregated Stream Compaction / Output Filtering Kernel
 // -----------------------------------------------------------------------------
 
 __global__ void filter_triangles_kernel(
@@ -519,7 +549,6 @@ __global__ void filter_triangles_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     bool is_valid = false;
     int3 mapped_tri = make_int3(-1, -1, -1);
-    int my_loc = -1;
 
     if (idx < num_triangles) {
         int3 t = triangles[idx];
@@ -530,9 +559,23 @@ __global__ void filter_triangles_kernel(
                 orig_indices[t.y],
                 orig_indices[t.z]
             );
-            my_loc = atomicAdd(&s_count, 1);
         }
     }
+
+    // Warp aggregation to minimize shared memory atomic contention
+    unsigned int active_mask = __activemask();
+    unsigned int ballot_mask = __ballot_sync(active_mask, is_valid);
+    int warp_count = __popc(ballot_mask);
+    int lane_id = tid & 31;
+    int warp_offset = __popc(ballot_mask & ((1u << lane_id) - 1));
+
+    int warp_base = 0;
+    if (lane_id == 0 && warp_count > 0) {
+        warp_base = atomicAdd(&s_count, warp_count);
+    }
+    warp_base = __shfl_sync(active_mask, warp_base, 0);
+    int my_loc = warp_base + warp_offset;
+
     __syncthreads();
 
     if (tid == 0 && s_count > 0) {
@@ -606,9 +649,9 @@ bool run_delaunay_triangulation(
     CUDA_CHECK(cudaMalloc(&d_max_y, sizeof(double)));
 
     uint32_t* d_sort_keys = nullptr;
-    PointWithIdx* d_sort_vals = nullptr;
+    int* d_sort_perm = nullptr;
     CUDA_CHECK(cudaMalloc(&d_sort_keys, padded_N * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sort_vals, padded_N * sizeof(PointWithIdx)));
+    CUDA_CHECK(cudaMalloc(&d_sort_perm, padded_N * sizeof(int)));
 
     Point2D* d_points = nullptr;
     int* d_orig_indices = nullptr;
@@ -679,17 +722,17 @@ bool run_delaunay_triangulation(
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 
     // -------------------------------------------------------------------------
-    // Step 3: Morton Key Generation & GPU Bitonic Sort with Shared Memory
+    // Step 3: Morton Key Generation & GPU Bitonic Sort (Zero Bank Conflicts)
     // -------------------------------------------------------------------------
-    normalize_and_morton_keys<<<blocks_padded, threads, 0, compute_stream>>>(
-        d_in_points, d_sort_vals, d_sort_keys,
+    compute_morton_keys_kernel<<<blocks_padded, threads, 0, compute_stream>>>(
+        d_in_points, d_sort_keys, d_sort_perm,
         h_min_x, h_max_x, h_min_y, h_max_y,
         N, padded_N
     );
 
     int bitonic_blocks = padded_N / 1024;
     bitonic_sort_shared_kernel<<<bitonic_blocks, 1024, 0, compute_stream>>>(
-        d_sort_keys, d_sort_vals, N, padded_N
+        d_sort_keys, d_sort_perm, padded_N
     );
 
     for (int k = 2048; k <= padded_N; k <<= 1) {
@@ -697,11 +740,11 @@ bool run_delaunay_triangulation(
             if (j >= 1024) {
                 int merge_blocks = (padded_N + threads - 1) / threads;
                 bitonic_merge_global_kernel<<<merge_blocks, threads, 0, compute_stream>>>(
-                    d_sort_keys, d_sort_vals, j, k, padded_N
+                    d_sort_keys, d_sort_perm, j, k, padded_N
                 );
             } else if (j == 512) {
                 bitonic_merge_shared_kernel<<<bitonic_blocks, 1024, 0, compute_stream>>>(
-                    d_sort_keys, d_sort_vals, k, padded_N
+                    d_sort_keys, d_sort_perm, k, padded_N
                 );
                 break;
             }
@@ -709,7 +752,8 @@ bool run_delaunay_triangulation(
     }
 
     unpack_sorted_points<<<blocks_N, threads, 0, compute_stream>>>(
-        d_sort_vals, d_points, d_orig_indices, N
+        d_in_points, d_sort_perm, d_points, d_orig_indices,
+        h_min_x, h_max_x, h_min_y, h_max_y, N
     );
 
     CUDA_CHECK(cudaEventRecord(stop_step, compute_stream));
@@ -890,7 +934,7 @@ bool run_delaunay_triangulation(
     CUDA_CHECK(cudaFree(d_min_y));
     CUDA_CHECK(cudaFree(d_max_y));
     CUDA_CHECK(cudaFree(d_sort_keys));
-    CUDA_CHECK(cudaFree(d_sort_vals));
+    CUDA_CHECK(cudaFree(d_sort_perm));
     CUDA_CHECK(cudaFree(d_points));
     CUDA_CHECK(cudaFree(d_orig_indices));
     CUDA_CHECK(cudaFree(d_triangles));
