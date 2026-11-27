@@ -47,4 +47,4 @@ Try to keep the main kernels agnostic to file format by using an appropriate dat
 
 ## Report
 
-Guidelines on preparint the report is given in `report_guidelines.md`
+Guidelines on preparint the report is given in `report_guidelines.md`.
