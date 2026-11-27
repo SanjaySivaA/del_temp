@@ -5,3 +5,4 @@ points.txt
 triangles.txt
 delaunay_gpu.png
 colab-results/
+.agents/
