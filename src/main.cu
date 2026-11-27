@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
         std::cout << "----------------------------------------------------\n";
         std::cout << std::fixed << std::setprecision(3);
         std::cout << " Host-to-Device (HtoD)   : " << stats.time_htod_ms << " ms\n";
-        std::cout << " Bounds & Bitonic Sort   : " << stats.time_sort_ms << " ms\n";
+        std::cout << " Bounds & Morton Sort   : " << stats.time_sort_ms << " ms\n";
         std::cout << " Point Insertion Phase   : " << stats.time_insertion_ms << " ms\n";
         std::cout << " Lawson Edge Flip Phase  : " << stats.time_flip_ms << " ms\n";
         std::cout << " Stream Compaction Filter: " << stats.time_filter_ms << " ms\n";

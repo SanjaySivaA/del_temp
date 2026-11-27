@@ -1,5 +1,8 @@
 #include "delaunay.cuh"
 #include "predicates.cuh"
+#include <thrust/sort.h>
+#include <thrust/execution_policy.h>
+#include <thrust/device_ptr.h>
 #include <iostream>
 #include <climits>
 #include <algorithm>
@@ -121,148 +124,25 @@ __global__ void compute_morton_keys_kernel(
     int* perm,
     double min_x, double max_x,
     double min_y, double max_y,
-    int n, int padded_n
+    int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= padded_n) return;
+    if (idx >= n) return;
 
-    if (idx < n) {
-        Point2D p = in_points[idx];
-        double span_x = max_x - min_x;
-        double span_y = max_y - min_y;
-        double span = fmax(span_x, span_y);
-        if (span <= 1e-12) span = 1.0;
+    Point2D p = in_points[idx];
+    double span_x = max_x - min_x;
+    double span_y = max_y - min_y;
+    double span = fmax(span_x, span_y);
+    if (span <= 1e-12) span = 1.0;
 
-        double norm_x = 0.1 + 0.8 * (p.x - min_x) / span;
-        double norm_y = 0.1 + 0.8 * (p.y - min_y) / span;
+    double norm_x = 0.1 + 0.8 * (p.x - min_x) / span;
+    double norm_y = 0.1 + 0.8 * (p.y - min_y) / span;
 
-        uint32_t qx = (uint32_t)fmin(fmax(norm_x * 65535.0, 0.0), 65535.0);
-        uint32_t qy = (uint32_t)fmin(fmax(norm_y * 65535.0, 0.0), 65535.0);
+    uint32_t qx = (uint32_t)fmin(fmax(norm_x * 65535.0, 0.0), 65535.0);
+    uint32_t qy = (uint32_t)fmin(fmax(norm_y * 65535.0, 0.0), 65535.0);
 
-        cell_keys[idx] = morton2D(qx, qy);
-        perm[idx] = idx;
-    } else {
-        cell_keys[idx] = 0xFFFFFFFFU;
-        perm[idx] = -1;
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Bitonic Sort with Shared Memory & Zero Bank Conflicts
-// (Using 4-byte keys and 4-byte indices: 100% bank-conflict-free)
-// -----------------------------------------------------------------------------
-
-__global__ void bitonic_sort_shared_kernel(
-    uint32_t* d_keys,
-    int* d_perm,
-    int padded_n
-) {
-    __shared__ uint32_t s_keys[1024];
-    __shared__ int s_perm[1024];
-
-    int tid = threadIdx.x;
-    int idx = blockIdx.x * 1024 + tid;
-
-    if (idx < padded_n) {
-        s_keys[tid] = d_keys[idx];
-        s_perm[tid] = d_perm[idx];
-    } else {
-        s_keys[tid] = 0xFFFFFFFFU;
-        s_perm[tid] = -1;
-    }
-    __syncthreads();
-
-    // Sort 1024 elements in shared memory
-    for (int k = 2; k <= 1024; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            int ixj = tid ^ j;
-            if (ixj > tid) {
-                if ((tid & k) == 0) {
-                    if (s_keys[tid] > s_keys[ixj]) {
-                        uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                        int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
-                    }
-                } else {
-                    if (s_keys[tid] < s_keys[ixj]) {
-                        uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                        int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    if (idx < padded_n) {
-        d_keys[idx] = s_keys[tid];
-        d_perm[idx] = s_perm[tid];
-    }
-}
-
-__global__ void bitonic_merge_global_kernel(
-    uint32_t* d_keys,
-    int* d_perm,
-    int j,
-    int k,
-    int padded_n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= padded_n) return;
-
-    int ixj = i ^ j;
-    if (ixj > i) {
-        if ((i & k) == 0) {
-            if (d_keys[i] > d_keys[ixj]) {
-                uint32_t tk = d_keys[i]; d_keys[i] = d_keys[ixj]; d_keys[ixj] = tk;
-                int tp = d_perm[i]; d_perm[i] = d_perm[ixj]; d_perm[ixj] = tp;
-            }
-        } else {
-            if (d_keys[i] < d_keys[ixj]) {
-                uint32_t tk = d_keys[i]; d_keys[i] = d_keys[ixj]; d_keys[ixj] = tk;
-                int tp = d_perm[i]; d_perm[i] = d_perm[ixj]; d_perm[ixj] = tp;
-            }
-        }
-    }
-}
-
-__global__ void bitonic_merge_shared_kernel(
-    uint32_t* d_keys,
-    int* d_perm,
-    int k,
-    int padded_n
-) {
-    __shared__ uint32_t s_keys[1024];
-    __shared__ int s_perm[1024];
-
-    int tid = threadIdx.x;
-    int idx = blockIdx.x * 1024 + tid;
-    if (idx >= padded_n) return;
-
-    s_keys[tid] = d_keys[idx];
-    s_perm[tid] = d_perm[idx];
-    __syncthreads();
-
-    // Complete inner stages in shared memory
-    for (int j = 512; j > 0; j >>= 1) {
-        int ixj = tid ^ j;
-        if (ixj > tid) {
-            if ((idx & k) == 0) {
-                if (s_keys[tid] > s_keys[ixj]) {
-                    uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                    int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
-                }
-            } else {
-                if (s_keys[tid] < s_keys[ixj]) {
-                    uint32_t tk = s_keys[tid]; s_keys[tid] = s_keys[ixj]; s_keys[ixj] = tk;
-                    int tp = s_perm[tid]; s_perm[tid] = s_perm[ixj]; s_perm[ixj] = tp;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    d_keys[idx] = s_keys[tid];
-    d_perm[idx] = s_perm[tid];
+    cell_keys[idx] = morton2D(qx, qy);
+    perm[idx] = idx;
 }
 
 __global__ void unpack_sorted_points(
@@ -606,13 +486,8 @@ bool run_delaunay_triangulation(
     stats.num_points = N;
     int max_triangles = 2 * N + 1;
 
-    // Find next power of 2 for bitonic sort
-    int padded_N = 1024;
-    while (padded_N < N) padded_N <<= 1;
-
     const int threads = 256;
     int blocks_N = (N + threads - 1) / threads;
-    int blocks_padded = (padded_N + threads - 1) / threads;
 
     // Create CUDA streams and events
     cudaStream_t compute_stream, reset_stream;
@@ -650,8 +525,8 @@ bool run_delaunay_triangulation(
 
     uint32_t* d_sort_keys = nullptr;
     int* d_sort_perm = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_sort_keys, padded_N * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sort_perm, padded_N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_sort_keys, N * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sort_perm, N * sizeof(int)));
 
     Point2D* d_points = nullptr;
     int* d_orig_indices = nullptr;
@@ -722,34 +597,17 @@ bool run_delaunay_triangulation(
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 
     // -------------------------------------------------------------------------
-    // Step 3: Morton Key Generation & GPU Bitonic Sort (Zero Bank Conflicts)
+    // Step 3: Morton Key Generation & Spatial Sort (thrust::sort_by_key)
     // -------------------------------------------------------------------------
-    compute_morton_keys_kernel<<<blocks_padded, threads, 0, compute_stream>>>(
+    compute_morton_keys_kernel<<<blocks_N, threads, 0, compute_stream>>>(
         d_in_points, d_sort_keys, d_sort_perm,
         h_min_x, h_max_x, h_min_y, h_max_y,
-        N, padded_N
+        N
     );
 
-    int bitonic_blocks = padded_N / 1024;
-    bitonic_sort_shared_kernel<<<bitonic_blocks, 1024, 0, compute_stream>>>(
-        d_sort_keys, d_sort_perm, padded_N
-    );
-
-    for (int k = 2048; k <= padded_N; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            if (j >= 1024) {
-                int merge_blocks = (padded_N + threads - 1) / threads;
-                bitonic_merge_global_kernel<<<merge_blocks, threads, 0, compute_stream>>>(
-                    d_sort_keys, d_sort_perm, j, k, padded_N
-                );
-            } else if (j == 512) {
-                bitonic_merge_shared_kernel<<<bitonic_blocks, 1024, 0, compute_stream>>>(
-                    d_sort_keys, d_sort_perm, k, padded_N
-                );
-                break;
-            }
-        }
-    }
+    thrust::device_ptr<uint32_t> dev_keys(d_sort_keys);
+    thrust::device_ptr<int> dev_perm(d_sort_perm);
+    thrust::sort_by_key(thrust::cuda::par.on(compute_stream), dev_keys, dev_keys + N, dev_perm);
 
     unpack_sorted_points<<<blocks_N, threads, 0, compute_stream>>>(
         d_in_points, d_sort_perm, d_points, d_orig_indices,

@@ -44,3 +44,7 @@ The workflow:
 2dpoints file -> cuda program -> triangle file
 
 Try to keep the main kernels agnostic to file format by using an appropriate data structures internally.
+
+## Report
+
+Guidelines on preparint the report is given in `report_guidelines.md`
