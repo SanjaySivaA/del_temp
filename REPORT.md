@@ -69,55 +69,272 @@ struct Triangle {
 
 ## 2. How the Algorithm Works (Step-by-Step)
 
-### High-Level Strategy: Parallel Spatial Grouping
-If threads insert points scattered all over the map at random, they access distant memory and fight for the same triangles.
+### The Mental Model: Building a Mesh from Scratch
+If you try to connect 10,000 points into triangles all at once, you face a combinatorial nightmare: edges cross each other, holes form, and tracking which points can connect becomes difficult.
 
-To parallelize efficiently across GPU warps:
-1. **Spatial Grouping (Concept)**: We trace a continuous, space-filling snake-like curve across the 2D plane (Z-order / Morton curve). Points that sit next to each other in 2D space are assigned consecutive numbers along this 1D curve.
-2. **Parallel Locality**: Adjacent GPU threads process points that are geometric neighbors. When threads walk the mesh to locate their triangles, they walk through the exact same local memory addresses, maximizing L1/L2 cache hits.
+Instead of building connections from a blank slate, this algorithm uses an approach called **Incremental Insertion with Edge Flipping**:
+
+1. **Create an Initial Sandbox**: We start with one giant triangle, called the *super-triangle*, that is large enough to contain every single input point inside it.
+2. **Drop Points into Triangles**: Whenever you drop a point inside an existing triangle, you can connect that point to the triangle's three corner vertices. One triangle cleanly splits into three smaller triangles.
+3. **Fix Bad Connections (Edge Flips)**: Splitting triangles into smaller pieces creates skinny, needle-like triangles. Once all points are inside the mesh, we look at pairs of neighboring triangles. If swapping their shared diagonal edge creates fatter triangles that satisfy the empty circle rule, we flip that edge. We keep flipping until every edge in the mesh is valid.
+4. **Remove the Sandbox**: We erase the three artificial corner vertices of the original giant triangle and discard any triangles attached to them. What remains is the exact Delaunay Triangulation of your original points.
+
+Running this process sequentially on a CPU is simple, but running it across thousands of parallel GPU threads requires addressing two challenges:
+- **Spatial locality**: How to prevent threads from thrashing memory when searching for triangles.
+- **Race conditions**: How to stop multiple threads from modifying the same triangle or edge simultaneously.
+
+Here is how each phase solves these problems on the GPU.
+
+---
+
+### Phase 1: Spatial Ordering for Warp Locality
+If thread 0 processes a point at coordinate (0.01, 0.01) while thread 1 processes a point at (0.99, 0.99), the two threads will walk in opposite directions across the 2D plane. They will access entirely different regions of GPU global memory, causing memory divergence and severe cache thrashing.
+
+To make threads cooperate:
+1. We compute the bounding box (minimum and maximum X and Y coordinates) of all points using a fast parallel reduction kernel.
+2. We map each 2D point coordinate $(x, y)$ to an integer along a 1D space-filling curve called a **Morton curve** (or Z-order curve). This curve weaves through 2D space like a recursive snake.
+3. Points that sit close to each other in 2D space receive numbers that are close to each other along the 1D curve.
+4. We sort the points along this curve using `thrust::sort_by_key`.
+
+Now, threads in the same 32-thread GPU warp process points located in the exact same physical neighborhood. When they search for triangles in memory, they read from the exact same cache lines.
 
 ```
-   2D Plane with Morton Curve Mapping            Points Assigned to Threads
-   +-------+-------+                              +-----------------------+
-   | (0,1) | (1,1) |   Thread 0 -> Point in cell 0 | Thread 0: (0.1, 0.1)  |
-   |   2   |   3   |   Thread 1 -> Point in cell 1 | Thread 1: (0.2, 0.15) |
-   +-------+-------+   Thread 2 -> Point in cell 2 | Thread 2: (0.1, 0.8)  |
-   |   0   |   1   |   Thread 3 -> Point in cell 3 | Thread 3: (0.8, 0.9)  |
-   | (0,0) | (1,0) |                               +-----------------------+
-   +-------+-------+                              Coalesced Memory Access!
+      2D Grid to 1D Morton Curve Mapping              Threads in Warp Access Same Cache Line
+      +-------+-------+-------+-------+
+      |  10   |  11   |  14   |  15   |               Thread 0: Point at (0.05, 0.05) [Key 0]
+      +-------+-------+-------+-------+               Thread 1: Point at (0.08, 0.12) [Key 0]
+      |   8   |   9   |  12   |  13   |               Thread 2: Point at (0.15, 0.08) [Key 1]
+      +-------+-------+-------+-------+               Thread 3: Point at (0.22, 0.18) [Key 2]
+      |   2   |   3   |   6   |   7   |
+      +-------+-------+-------+-------+               Nearby points mean neighboring threads
+      |   0   |   1   |   4   |   5   |               read the exact same triangle memory!
+      +-------+-------+-------+-------+
 ```
 
-### End-to-End Execution Pipeline
+---
+
+### Phase 2: Setting up the Super-Triangle Sandbox
+Before inserting points, the GPU initializes the canvas with a single triangle:
+- Point $N$ at $(-100.0, -100.0)$
+- Point $N+1$ at $(100.0, -100.0)$
+- Point $N+2$ at $(0.0, 100.0)$
+
+Because all input points are normalized to $[0.1, 0.9] \times [0.1, 0.9]$, every point is deep inside this initial triangle. 
+
+We maintain two primary arrays in GPU global memory:
+- `triangles[t]`: Stores the three vertex indices $(v_0, v_1, v_2)$ for triangle $t$.
+- `neighbors[t]`: Stores the indices of the three neighboring triangles that share an edge with triangle $t$. If an edge lies on the outer boundary of the mesh, its neighbor index is set to $-1$.
+
+At initialization, `triangles[0] = {N, N+1, N+2}` and `neighbors[0] = {-1, -1, -1}`.
+
+---
+
+### Phase 3: Inserting Points in Parallel Waves
+We cannot insert all points in one parallel step. If five threads try to split the same triangle simultaneously, they will overwrite each other's writes and corrupt the mesh. 
+
+Instead, insertion proceeds in **iterative waves** until every point is placed:
+
 ```
-[Host RAM: Points] 
-       │  (cudaMemcpyAsync)
-       ▼
-1. GPU Bounding Box Reduction (Shared memory min/max coordinate reduction)
-       │
-       ▼
-2. Morton Spatial Key Generation & Sorting (thrust::sort_by_key on compute_stream)
-       │
-       ▼
-3. Enclosing Super-Triangle Initialization (Single giant triangle covering all points)
-       │
-       ▼
-4. Iterative Point Insertion Waves (Repeats until all points are placed):
-   ├── A. Jump-and-Walk Location (Threads step across neighbors to find container)
-   ├── B. Conflict-Free Vote (Atomic vote elects one point per triangle)
-   ├── C. 1-to-3 Triangle Splitting (Adds new vertices; updates triangle array)
-   └── D. Neighbor Pointers Repair (Rewires adjacent triangle edge links)
-       │
-       ▼
-5. 2-Phase Parallel Lawson Edge Flipping (Repeats until empty-circle rule passes):
-   ├── A. Propose & Lock Flips (Identifies illegal diagonals; locks pairs with atomicCAS)
-   ├── B. Execute Flips (Swaps diagonal edges for locked pairs)
-   └── C. Repair Flipped Neighbors (Updates adjoining neighbor references)
-       │
-       ▼
-6. Stream Compaction Filter (Warp-aggregated filter removes super-triangle artifacts)
-       │  (cudaMemcpyAsync)
-       ▼
-[Host RAM: Valid Triangles Output]
+                          Point Insertion Wave Loop
+                          
+  [ Uninserted Points ] ──► Step A: Walk Mesh to Locate Containing Triangle
+                                   │
+                                   ▼
+                            Step B: Atomic Vote
+                            (One point wins per triangle)
+                                   │
+                                   ▼
+                            Step C: 1-to-3 Triangle Split
+                            (Winning triangles become 3 smaller triangles)
+                                   │
+                                   ▼
+                            Step D: Repair Neighbor Pointers
+                                   │
+                                   ▼
+                           All points placed? ──(No)──► Repeat Wave
+                                   │ (Yes)
+                                   ▼
+                         Proceed to Edge Flipping
+```
+
+#### Step A: Mesh Walking (Jump-and-Walk)
+Each thread is assigned one point. To find which triangle contains that point:
+- The thread starts at a known triangle (initially triangle 0).
+- It runs a 2D orientation test on each of the triangle's three edges. The orientation test calculates the signed area of a small triangle formed by the edge and the test point. A positive value means the point is to the left of the directed edge; a negative value means it is to the right.
+- If the point is to the right of an edge, it lies outside that edge. The thread follows the `neighbors` pointer across that edge into the adjacent triangle.
+- The thread repeats this hop until the point is inside all three edges of the current triangle.
+- Because points are sorted spatially and remember their containing triangle from previous waves, walking takes only a few hops per wave.
+
+#### Step B: Voting for Triangle Ownership
+Multiple uninserted points often land inside the same triangle. To avoid write collisions:
+- Every point inside triangle $T$ attempts an atomic minimum on a shared voting slot: `atomicMin(&tri_winner[T], point_id)`.
+- The point with the smallest ID wins the right to split triangle $T$ in this wave.
+- The other points do nothing and remain uninserted, waiting for the next wave.
+
+#### Step C: 1-to-3 Triangle Splitting
+For every triangle $T$ that had a winner:
+- The thread allocates two new triangle slots in global memory using `atomicAdd(num_triangles, 2)`.
+- The original slot $T$ is reused as Child 0. The two newly allocated slots become Child 1 and Child 2.
+- Point $P$ is placed inside, and edges are drawn from $P$ to the three corners of $T$.
+- One triangle is now replaced by three smaller triangles, all correctly wound in counter-clockwise order.
+
+```
+             Before Split                               After 1-to-3 Split
+                  v2                                            v2
+                 /  \                                          / | \
+                /    \                                        /  |  \
+               /  P   \        ==== 1-to-3 Split ====>       /  (c0) \
+              /        \                                    /    |    \
+             /          \                                  / c1  P  c2 \
+            v0 -------- v1                                v0 ---───--- v1
+```
+
+#### Step D: Neighbor Pointer Repair
+When triangle $T$ splits into three children, the surrounding triangles that bordered $T$ still hold obsolete pointers pointing to the old single triangle $T$.
+- A repair kernel runs across all triangles.
+- Each thread checks whether its neighbors were split during this wave. If so, it looks up the split record to find which of the three children now shares that specific edge, and updates its neighbor pointer accordingly.
+
+This wave loop repeats until all points have been inserted.
+
+---
+
+### Phase 4: Fixing Illegal Edges (Parallel Lawson Edge Flipping)
+After insertion finishes, all points exist within a continuous triangular mesh. However, many triangles are skinny and irregular. We now convert this mesh into a Delaunay mesh by flipping edges that violate the empty circle rule.
+
+#### What is an Edge Flip?
+Look at two neighboring triangles, $ABC$ and $BDC$, that share edge $BC$. Together they form a four-sided quadrilateral $ABDC$:
+
+```
+        Before Flip (Illegal Edge BC)           After Flip (Legal Edge AD)
+                     A                                       A
+                   / | \                                   /   \
+                  /  |  \                                 /     \
+                 B   |   C        === Edge Flip ===>     B ────── C
+                  \  |  /                                 \     /
+                   \ | /                                   \   /
+                     D                                       D
+            (Skinny triangles)                      (Fatter triangles)
+```
+
+- We test whether vertex $D$ lies inside the circumcircle of triangle $ABC$.
+- If $D$ is inside the circle, edge $BC$ violates the Delaunay rule.
+- We erase edge $BC$ and connect vertex $A$ to vertex $D$ instead.
+- This single swap replaces two skinny triangles with two wider, more equiangular triangles.
+
+#### How We Flip in Parallel on the GPU
+If two threads try to flip adjacent edges at the same time, they will access the same vertices and scramble the mesh topology. We avoid race conditions using a **2-Phase Lock and Execute mechanism**:
+
+```
+                  Parallel Edge Flipping Round Loop
+                  
+  [ All Triangles ] ──► Phase 1: Propose Flips & Acquire Locks
+                                 - Thread t checks neighbor n (where t < n)
+                                 - Checks empty-circle rule and convexity
+                                 - Locks both t and n using atomicCAS
+                                 │
+                                 ▼
+                        Phase 2: Execute Locked Flips
+                                 - Winning thread swaps diagonal edge
+                                 - Updates 2 triangle slots and neighbor links
+                                 │
+                                 ▼
+                        Phase 3: Repair Surrounding Neighbors
+                                 - Adjacent triangles update neighbor pointers
+                                 │
+                                 ▼
+                     Any flips performed? ──(Yes)──► Next Round
+                                 │ (No)
+                                 ▼
+                   Mesh is Guaranteed Delaunay!
+```
+
+1. **Phase 1: Propose and Lock**:
+   - Each thread inspects triangle $t$ and its neighbor $n$.
+   - To prevent deadlocks, thread $t$ only considers neighbors with higher indices ($t < n$).
+   - If edge $(t, n)$ violates the empty circle rule and the four points form a strictly convex quadrilateral, thread $t$ attempts to lock both triangles:
+     ```cpp
+     if (atomicCAS(&tri_lock[t], -1, t) == -1) {
+         if (atomicCAS(&tri_lock[n], -1, t) == -1) {
+             // Successfully locked both triangles: mark edge for flipping
+         } else {
+             atomicExch(&tri_lock[t], -1); // Roll back if neighbor was busy
+         }
+     }
+     ```
+   - Only non-conflicting pairs are locked in any given round.
+
+2. **Phase 2: Execute Flips**:
+   - Each thread that successfully locked a pair updates the vertex indices of triangles $t$ and $n$ to draw the new diagonal.
+   - It updates the internal neighbor pointers between $t$ and $n$.
+
+3. **Phase 3: Repair Neighbor References**:
+   - Surrounding triangles whose shared edges moved during the flip update their neighbor pointers to point to the correct triangle.
+
+We repeat this three-step round until zero flips occur across the entire mesh (typically 10 to 30 rounds). Lawson's theorem guarantees that this process always terminates, and when zero flips remain, every triangle in the mesh satisfies the empty circle rule.
+
+---
+
+### Phase 5: Erasing the Super-Triangle and Compacting Output
+The triangulation is now mathematically Delaunay, but it still contains the three artificial super-triangle vertices $(N, N+1, N+2)$ and their attached boundary triangles.
+
+To finalize the output:
+1. A stream compaction kernel inspects each triangle.
+2. If any of the triangle's three corners has an index $\ge N$, that triangle is connected to the super-triangle and is discarded.
+3. If all three corners are $< N$, the triangle is a genuine part of the original point set. The thread remaps the internal sorted point indices back to the original input point IDs.
+4. Using warp-level aggregation, valid triangles are written into a contiguous output buffer and transferred back to host RAM.
+
+---
+
+### Complete High-Level Execution Pseudocode
+
+```
+Algorithm: GPU-Accelerated 2D Delaunay Triangulation
+
+Input : Array of N 2D points on host
+Output: Array of Delaunay triangles (each a triple of point indices)
+
+Host Execution:
+1. Allocate pinned host buffers and device memory via cudaMalloc.
+2. Copy input points to device asynchronously on compute_stream.
+3. Launch compute_bounds_kernel: reduce min/max coordinates using shared memory.
+4. Launch compute_morton_keys_kernel: map (x, y) coordinates to 1D Morton curve keys.
+5. Sort (keys, permutation_indices) using thrust::sort_by_key on compute_stream.
+6. Launch unpack_sorted_points: arrange points in sorted order.
+7. Launch init_super_triangle: write vertices (N, N+1, N+2) and initial triangle 0.
+
+Point Insertion Loop:
+8. While (uninserted points remain):
+     a. On reset_stream: clear tri_winner votes and split_base buffers using cudaMemsetAsync.
+     b. Trigger compute_stream to proceed via cudaStreamWaitEvent.
+     c. Launch locate_and_vote:
+          - Each thread walks across neighbor pointers using 2D orientation tests.
+          - Upon reaching containing triangle t, cast atomic vote: atomicMin(&tri_winner[t], point_id).
+     d. Launch split_triangles:
+          - Winning triangles allocate 2 new slots via atomicAdd(num_triangles, 2).
+          - Split container into 3 child triangles and update internal links.
+     e. Launch repair_neighbors:
+          - Neighbor triangles re-point their adjacency references to the correct child.
+
+Edge Flipping Loop:
+9. Loop:
+     a. On reset_stream: clear tri_lock, flip_edge, and flip_count buffers.
+     b. Trigger compute_stream via cudaStreamWaitEvent.
+     c. Launch propose_flips:
+          - Inspect shared edges where neighbor index n > t.
+          - If opposite vertex fails empty-circle test, lock t and n using atomicCAS.
+     d. Read flip_count back to host. If flip_count == 0, break loop.
+     e. Launch execute_flips:
+          - Locked pairs swap the shared diagonal edge and re-link internal neighbors.
+     f. Launch repair_flipped_neighbors:
+          - Adjacent triangles update neighbor references to reflect flipped diagonals.
+
+Output Compaction:
+10. Launch filter_triangles_kernel:
+      - Discard triangles containing super-triangle vertices (index >= N).
+      - Remap valid triangle vertices back to original input point IDs.
+      - Aggregate counts using warp ballots and write to contiguous output array.
+11. Copy final triangles buffer to host RAM asynchronously and synchronize.
+12. Free all host and device memory buffers.
 ```
 
 ---
@@ -365,9 +582,9 @@ reset_stream:   [ Memset(tri_winner) ] ──► [ Memset(split_base) ] ──�
 ## 7. References & Lineage
 
 1. **Foundational Edge Flipping**:
-   Lawson, C. L. (1977). *Software for $C^1$ surface interpolation*. Mathematical Software III, Academic Press, pp. 161–194. (Introduced the empty-circumcircle criterion and local edge-flipping theorem).
+   Lawson, C. L. (1977). *Software for $C^1$ surface interpolation*. Mathematical Software III, Academic Press, pp. 161-194. (Introduced the empty-circumcircle criterion and local edge-flipping theorem).
 2. **Jump-and-Walk Point Location**:
-   Green, P. J., & Sibson, R. (1977). *Computing Dirichlet tessellations in the plane*. The Computer Journal, 21(2), pp. 168–173. (The stochastic/steepest directed walk through triangular adjacencies).
+   Green, P. J., & Sibson, R. (1977). *Computing Dirichlet tessellations in the plane*. The Computer Journal, 21(2), pp. 168-173. (The stochastic/steepest directed walk through triangular adjacencies).
 3. **Problem Based Benchmark Suite (PBBS)**:
    Shun, J., Blelloch, G. E., Fineman, J. T., Gibbons, P. B., Kyrola, A., Harsha, P. B. B., & Simhadri, H. V. (2012). *Brief announcement: the Problem Based Benchmark Suite*. SPAA '12. (Defines the standard `pbbs_sequencePoint2d` and `pbbs_triangles` file formats used in this repository).
 4. **GPU Delaunay Triangulation Research**:
